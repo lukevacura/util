@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: auto-format staged files by extension.
+# Install: cp hook .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Requires Bash >= 4.0 (for associative arrays).
+# macOS ships Bash 3.2 — install a newer version via: brew install bash
+
+set -euo pipefail
+
+# --- Bash version check ---
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "pre-commit hook requires Bash >= 4.0 (found $BASH_VERSION)." >&2
+  echo "Install a newer version: brew install bash" >&2
+  exit 1
+fi
+
+# Collect staged files (Added, Copied, Modified, Renamed)
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if [[ -z "$staged_files" ]]; then
+  exit 0
+fi
+
+# --- Stash unstaged changes to protect partial staging ---
+# This ensures we only format what is actually staged, so that
+# partially-staged files (via git add -p) are handled correctly.
+stash_name="pre-commit-hook-$(date +%s)"
+has_stash=false
+if ! git diff --quiet; then
+  git stash push --keep-index --quiet -m "$stash_name"
+  has_stash=true
+fi
+
+# Restore unstaged changes on exit (success or failure)
+cleanup() {
+  if $has_stash; then
+    git stash pop --quiet 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# Group files by extension
+declare -A files_by_ext
+
+while IFS= read -r file; do
+  [[ -f "$file" ]] || continue
+  ext="${file##*.}"
+  files_by_ext["$ext"]+="$file"$'\n'
+done <<< "$staged_files"
+
+formatted=false
+
+# --- Go ---
+if [[ -n "${files_by_ext[go]:-}" ]]; then
+  if command -v gofmt &>/dev/null; then
+    echo "Running gofmt..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      gofmt -w "$f"
+      git add "$f"
+    done <<< "${files_by_ext[go]}"
+    formatted=true
+  else
+    echo "gofmt not found, skipping Go formatting"
+  fi
+fi
+
+# --- Rust ---
+if [[ -n "${files_by_ext[rs]:-}" ]]; then
+  if command -v rustfmt &>/dev/null; then
+    echo "Running rustfmt..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      rustfmt "$f"
+      git add "$f"
+    done <<< "${files_by_ext[rs]}"
+    formatted=true
+  else
+    echo "rustfmt not found, skipping Rust formatting"
+  fi
+fi
+
+# --- Python ---
+for ext in py pyi; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v black &>/dev/null; then
+      echo "Running black on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        black --quiet "$f"
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    elif command -v ruff &>/dev/null; then
+      echo "Running ruff format on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        ruff format --quiet "$f"
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    else
+      echo "Neither black nor ruff found, skipping Python formatting"
+    fi
+  fi
+done
+
+# --- JavaScript / TypeScript / JSX / TSX ---
+for ext in js jsx ts tsx; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v prettier &>/dev/null; then
+      echo "Running prettier on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        prettier --write "$f" 2>/dev/null
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    else
+      echo "prettier not found, skipping JS/TS formatting"
+    fi
+  fi
+done
+
+# --- JSON ---
+if [[ -n "${files_by_ext[json]:-}" ]]; then
+  if command -v prettier &>/dev/null; then
+    echo "Running prettier on .json files..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      prettier --write "$f" 2>/dev/null
+      git add "$f"
+    done <<< "${files_by_ext[json]}"
+    formatted=true
+  fi
+fi
+
+# --- YAML / YML ---
+for ext in yaml yml; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v prettier &>/dev/null; then
+      echo "Running prettier on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        prettier --write "$f" 2>/dev/null
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    fi
+  fi
+done
+
+# --- C / C++ / Objective-C ---
+for ext in c h cpp hpp cc cxx m mm; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v clang-format &>/dev/null; then
+      echo "Running clang-format on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        clang-format -i "$f"
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    else
+      echo "clang-format not found, skipping C/C++ formatting"
+    fi
+  fi
+done
+
+# --- Java ---
+if [[ -n "${files_by_ext[java]:-}" ]]; then
+  if command -v google-java-format &>/dev/null; then
+    echo "Running google-java-format..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      google-java-format --replace "$f"
+      git add "$f"
+    done <<< "${files_by_ext[java]}"
+    formatted=true
+  else
+    echo "google-java-format not found, skipping Java formatting"
+  fi
+fi
+
+# --- Shell ---
+for ext in sh bash zsh; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v shfmt &>/dev/null; then
+      echo "Running shfmt on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        shfmt -w "$f"
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    else
+      echo "shfmt not found, skipping shell formatting"
+    fi
+  fi
+done
+
+# --- Terraform ---
+if [[ -n "${files_by_ext[tf]:-}" ]]; then
+  if command -v terraform &>/dev/null; then
+    echo "Running terraform fmt..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      terraform fmt "$f"
+      git add "$f"
+    done <<< "${files_by_ext[tf]}"
+    formatted=true
+  fi
+fi
+
+# --- Markdown ---
+if [[ -n "${files_by_ext[md]:-}" ]]; then
+  if command -v prettier &>/dev/null; then
+    echo "Running prettier on .md files..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      prettier --write "$f" 2>/dev/null
+      git add "$f"
+    done <<< "${files_by_ext[md]}"
+    formatted=true
+  fi
+fi
+
+# --- CSS / SCSS / LESS ---
+for ext in css scss less; do
+  if [[ -n "${files_by_ext[$ext]:-}" ]]; then
+    if command -v prettier &>/dev/null; then
+      echo "Running prettier on .$ext files..."
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        prettier --write "$f" 2>/dev/null
+        git add "$f"
+      done <<< "${files_by_ext[$ext]}"
+      formatted=true
+    fi
+  fi
+done
+
+# --- Protobuf ---
+if [[ -n "${files_by_ext[proto]:-}" ]]; then
+  if command -v buf &>/dev/null; then
+    echo "Running buf format on .proto files..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      buf format -w "$f"
+      git add "$f"
+    done <<< "${files_by_ext[proto]}"
+    formatted=true
+  elif command -v clang-format &>/dev/null; then
+    echo "Running clang-format on .proto files..."
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      clang-format -i "$f"
+      git add "$f"
+    done <<< "${files_by_ext[proto]}"
+    formatted=true
+  fi
+fi
+
+if $formatted; then
+  echo "Formatting complete — changes re-staged."
+fi
+
+exit 0
