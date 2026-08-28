@@ -28,8 +28,11 @@ fi
 stash_name="pre-commit-hook-$(date +%s)"
 has_stash=false
 if ! git diff --quiet; then
-  git stash push --keep-index --quiet -m "$stash_name"
-  has_stash=true
+  if git stash push --keep-index --quiet -m "$stash_name"; then
+    has_stash=true
+  else
+    echo "Warning: could not stash unstaged changes (possibly mid-rebase/merge); formatting may affect unstaged work." >&2
+  fi
 fi
 
 # Restore unstaged changes on exit (success or failure)
@@ -40,11 +43,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Detect unresolved merge/rebase conflict markers. Git always emits a
+# matching pair of <<<<<<< / >>>>>>> markers, so checking for those two is
+# reliable and avoids false positives on legitimate "=======" dividers.
+has_conflict_markers() {
+  grep -Eq '^(<<<<<<<|>>>>>>>)( |$)' "$1" 2>/dev/null
+}
+
 # Group files by extension
 declare -A files_by_ext
 
 while IFS= read -r file; do
   [[ -f "$file" ]] || continue
+  if has_conflict_markers "$file"; then
+    echo "Skipping $file: unresolved merge/rebase conflict markers — not formatting." >&2
+    continue
+  fi
   ext="${file##*.}"
   files_by_ext["$ext"]+="$file"$'\n'
 done <<< "$staged_files"
@@ -53,13 +67,37 @@ formatted=false
 
 # --- Go ---
 if [[ -n "${files_by_ext[go]:-}" ]]; then
-  if command -v gofmt &>/dev/null; then
+  go_files=()
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    go_files+=("$f")
+  done <<< "${files_by_ext[go]}"
+
+  # Run `go fix` on the packages containing changed files (dedup dirs).
+  # go fix rewrites code to use newer APIs; run it before gofmt so the
+  # result is also formatted. Failures (e.g. package won't build) are
+  # non-fatal so they don't block the commit.
+  if command -v go &>/dev/null && ((${#go_files[@]})); then
+    declare -A go_dirs=()
+    for f in "${go_files[@]}"; do
+      go_dirs["$(dirname "$f")"]=1
+    done
+    echo "Running go fix..."
+    for dir in "${!go_dirs[@]}"; do
+      ( cd "$dir" && go fix . 2>/dev/null ) \
+        || echo "go fix: failed in $dir (skipping)" >&2
+    done
+    formatted=true
+  else
+    echo "go not found, skipping go fix"
+  fi
+
+  if command -v gofmt &>/dev/null && ((${#go_files[@]})); then
     echo "Running gofmt..."
-    while IFS= read -r f; do
-      [[ -z "$f" ]] && continue
+    for f in "${go_files[@]}"; do
       gofmt -w "$f"
       git add "$f"
-    done <<< "${files_by_ext[go]}"
+    done
     formatted=true
   else
     echo "gofmt not found, skipping Go formatting"
