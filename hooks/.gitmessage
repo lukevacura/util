@@ -1,0 +1,39 @@
+# Commit message — lines starting with '#' are ignored by git.
+#
+# Suggested format (Conventional Commits):
+#   <type>(<scope>): <subject>
+#
+#   <body explaining the "why">
+#
+#   type: feat | fix | docs | style | refactor | perf | test | chore
+#
+# Branch: {{BRANCH}}
+# Ticket: {{TICKET}}
+#
+# Tip: to auto-prefix the subject with the ticket, replace the blank line
+# below with: {{TICKET}}: <subject>
+
+# TITLE BELOW
+Title
+---
+
+Why is this change being made? 
+---
+
+What is changing? 
+---
+
+How has this change been verified?  
+---
+This change has been tested by ...
+
+How have I verified this is safe for production? 
+---
+The risk of this change is ...
+
+If something goes wrong with this change, it can be detected by ...
+
+Rollback for this change can be performed by ...
+
+Related Items
+---

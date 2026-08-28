@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Pre-commit hook: auto-format staged files by extension.
-# Install: cp hook .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Pre-commit hook: auto-format staged files by extension, plus guards.
+# Install: cp hooks/precommit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# (or use the installer in hooks/README.md)
 #
 # Requires Bash >= 4.0 (for associative arrays).
 # macOS ships Bash 3.2 — install a newer version via: brew install bash
@@ -22,6 +23,112 @@ if [[ -z "$staged_files" ]]; then
   exit 0
 fi
 
+# Array form (no empty entries) for pathspec-based guards.
+staged_arr=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] && staged_arr+=("$f")
+done <<< "$staged_files"
+
+# --- Guard: warn when committing directly to protected branches ---
+# Space-separated glob patterns; override via PRECOMMIT_PROTECTED_BRANCHES.
+# Silence entirely with PRECOMMIT_ALLOW_PROTECTED=1 (e.g. intentional merges).
+# Only prompted when more than one branch exists, so a fresh repo with only
+# its initial branch isn't bothered. Interactively asks yes/no; in a
+# non-interactive context (no controlling terminal, e.g. CI/scripts) it
+# warns and proceeds rather than hanging.
+protected_branches="${PRECOMMIT_PROTECTED_BRANCHES:-main master release/*}"
+current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+branch_count=$(git for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null | wc -l | tr -d ' ')
+if [[ -n "$current_branch" && "${PRECOMMIT_ALLOW_PROTECTED:-0}" != "1" && "$branch_count" -gt 1 ]]; then
+  protected_match=""
+  for pat in $protected_branches; do
+    # shellcheck disable=SC2053
+    if [[ "$current_branch" == $pat ]]; then
+      protected_match="$pat"
+      break
+    fi
+  done
+  if [[ -n "$protected_match" ]]; then
+    echo "Warning: committing directly to protected branch '$current_branch' (matches '$protected_match')." >&2
+    echo "Use a feature branch / pull request, or set PRECOMMIT_ALLOW_PROTECTED=1 to silence this." >&2
+    # Read the prompt from /dev/tty: git closes the hook's stdin, so plain
+    # `read` would not see the user's answer.
+    if (exec </dev/tty) 2>/dev/null; then
+      printf 'Continue anyway? [y/N]: ' >&2
+      resp=""
+      read -r resp </dev/tty 2>/dev/null || resp=""
+      case "$resp" in
+        y|Y|yes|YES) echo "Proceeding." >&2 ;;
+        *) echo "Aborting commit." >&2; exit 1 ;;
+      esac
+    else
+      echo "(non-interactive; proceeding. Set PRECOMMIT_ALLOW_PROTECTED=1 to silence.)" >&2
+    fi
+  fi
+fi
+
+# --- Guard: reject oversized staged files ---
+# Default 1 MiB. Override with PRECOMMIT_MAX_FILE_SIZE (bytes, or e.g. 5M / 200K).
+# Set to 0 to disable.
+max_size="${PRECOMMIT_MAX_FILE_SIZE:-1048576}"
+case "$max_size" in
+  *[Kk]) max_size=$(( ${max_size%[Kk]} * 1024 )) ;;
+  *[Mm]) max_size=$(( ${max_size%[Mm]} * 1024 * 1024 )) ;;
+  *[Gg]) max_size=$(( ${max_size%[Gg]} * 1024 * 1024 * 1024 )) ;;
+esac
+if (( max_size > 0 )); then
+  oversized=()
+  for f in "${staged_arr[@]}"; do
+    size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+    if (( size > max_size )); then
+      oversized+=("$f ($size bytes)")
+    fi
+  done
+  if ((${#oversized[@]})); then
+    echo "Refusing to commit oversized files (limit ${max_size} bytes):" >&2
+    for o in "${oversized[@]}"; do echo "  - $o" >&2; done
+    echo "Raise PRECOMMIT_MAX_FILE_SIZE or set it to 0 to disable." >&2
+    exit 1
+  fi
+fi
+
+# --- Guard: scan staged content for likely secrets ---
+# Searches the staged (index) blobs. Silence entirely with PRECOMMIT_SKIP_SECRETS=1.
+# Interactively asks yes/no; in a non-interactive context (no controlling
+# terminal, e.g. CI/scripts) it warns and proceeds rather than hanging.
+if [[ "${PRECOMMIT_SKIP_SECRETS:-0}" != "1" ]]; then
+  secret_patterns=(
+    "AKIA[0-9A-Z]{16}"
+    "-----BEGIN (RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+    "gh[pousr]_[A-Za-z0-9]{36}"
+    "AIza[0-9A-Za-z_-]{35}"
+    "xox[baprs]-[0-9A-Za-z-]{10,}"
+    "(api[_-]?key|secret|password|passwd|token)[\"'[:space:]]*[:=][\"'[:space:]]*[A-Za-z0-9_/-]{20,}"
+  )
+  grep_args=()
+  for p in "${secret_patterns[@]}"; do grep_args+=(-e "$p"); done
+  hits=$(git grep -nE --cached "${grep_args[@]}" -- "${staged_arr[@]}" 2>/dev/null || true)
+  if [[ -n "$hits" ]]; then
+    echo "Warning: potential secrets detected in staged content:" >&2
+    printf '%s\n' "$hits" | head -50 >&2
+    echo "Committing secrets is usually irreversible. Use a feature branch / pull request," >&2
+    echo "or set PRECOMMIT_SKIP_SECRETS=1 to silence this." >&2
+    # Read the prompt from /dev/tty: git closes the hook's stdin, so plain
+    # `read` would not see the user's answer.
+    if (exec </dev/tty) 2>/dev/null; then
+      printf 'Continue anyway? [y/N]: ' >&2
+      resp=""
+      read -r resp </dev/tty 2>/dev/null || resp=""
+      case "$resp" in
+        y|Y|yes|YES) echo "Proceeding." >&2 ;;
+        *) echo "Aborting commit." >&2; exit 1 ;;
+      esac
+    else
+      echo "(non-interactive; proceeding. Set PRECOMMIT_SKIP_SECRETS=1 to silence.)" >&2
+    fi
+  fi
+fi
+
 # --- Stash unstaged changes to protect partial staging ---
 # This ensures we only format what is actually staged, so that
 # partially-staged files (via git add -p) are handled correctly.
@@ -35,10 +142,23 @@ if ! git diff --quiet; then
   fi
 fi
 
-# Restore unstaged changes on exit (success or failure)
+# Restore unstaged changes on exit (success or failure). If the pop
+# conflicts (formatting changed lines that also had unstaged changes), git
+# leaves those paths unmerged in the index; we must NOT silently continue,
+# or git fails downstream with a cryptic "Error building trees". Abort
+# here with a clear, actionable message instead.
 cleanup() {
   if $has_stash; then
-    git stash pop --quiet 2>/dev/null || true
+    if ! git stash pop --quiet 2>/dev/null; then
+      echo "pre-commit: could not cleanly restore your unstaged changes after formatting." >&2
+      echo "A stash pop conflict left some paths unmerged, so the commit was not created." >&2
+      echo "The stash is preserved (already partially applied). To recover:" >&2
+      echo "  1. Resolve the conflict markers in the affected files" >&2
+      echo "  2. git add <files>" >&2
+      echo "  3. git stash drop   # the stash is no longer needed" >&2
+      echo "Then re-run your commit." >&2
+      exit 1
+    fi
   fi
 }
 trap cleanup EXIT
@@ -52,16 +172,33 @@ has_conflict_markers() {
 
 # Group files by extension
 declare -A files_by_ext
+conflict_files=()
 
 while IFS= read -r file; do
   [[ -f "$file" ]] || continue
   if has_conflict_markers "$file"; then
-    echo "Skipping $file: unresolved merge/rebase conflict markers — not formatting." >&2
+    conflict_files+=("$file")
     continue
   fi
   ext="${file##*.}"
   files_by_ext["$ext"]+="$file"$'\n'
 done <<< "$staged_files"
+
+# Decide what to do with files containing conflict markers.
+# Default: skip formatting and allow the commit. Set PRECOMMIT_BLOCK_CONFLICTS=1
+# to refuse the commit instead, forcing conflicts to be resolved first.
+if ((${#conflict_files[@]})); then
+  if [[ "${PRECOMMIT_BLOCK_CONFLICTS:-0}" == "1" ]]; then
+    echo "Unresolved merge/rebase conflict markers in staged files — refusing to commit:" >&2
+    for c in "${conflict_files[@]}"; do echo "  - $c" >&2; done
+    echo "Resolve the conflicts, or unset PRECOMMIT_BLOCK_CONFLICTS to allow committing as-is." >&2
+    exit 1
+  else
+    for c in "${conflict_files[@]}"; do
+      echo "Skipping $c: unresolved merge/rebase conflict markers — not formatting." >&2
+    done
+  fi
+fi
 
 formatted=false
 
@@ -73,15 +210,16 @@ if [[ -n "${files_by_ext[go]:-}" ]]; then
     go_files+=("$f")
   done <<< "${files_by_ext[go]}"
 
+  declare -A go_dirs=()
+  for f in "${go_files[@]}"; do
+    go_dirs["$(dirname "$f")"]=1
+  done
+
   # Run `go fix` on the packages containing changed files (dedup dirs).
   # go fix rewrites code to use newer APIs; run it before gofmt so the
   # result is also formatted. Failures (e.g. package won't build) are
   # non-fatal so they don't block the commit.
   if command -v go &>/dev/null && ((${#go_files[@]})); then
-    declare -A go_dirs=()
-    for f in "${go_files[@]}"; do
-      go_dirs["$(dirname "$f")"]=1
-    done
     echo "Running go fix..."
     for dir in "${!go_dirs[@]}"; do
       ( cd "$dir" && go fix . 2>/dev/null ) \
@@ -101,6 +239,22 @@ if [[ -n "${files_by_ext[go]:-}" ]]; then
     formatted=true
   else
     echo "gofmt not found, skipping Go formatting"
+  fi
+
+  # Run `go vet` on the changed packages. Non-fatal by default (findings are
+  # printed as warnings); set PRECOMMIT_VET_FATAL=1 to make them block.
+  if command -v go &>/dev/null && ((${#go_files[@]})); then
+    echo "Running go vet..."
+    vet_failed=0
+    for dir in "${!go_dirs[@]}"; do
+      if ! ( cd "$dir" && go vet . 2>&1 ); then
+        vet_failed=1
+      fi
+    done
+    if [[ "${PRECOMMIT_VET_FATAL:-0}" == "1" && "$vet_failed" == "1" ]]; then
+      echo "go vet found issues — refusing to commit (PRECOMMIT_VET_FATAL=1)." >&2
+      exit 1
+    fi
   fi
 fi
 

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# prepare-commit-msg hook: seed the commit message from a .gitmessage template
+# and substitute branch/ticket placeholders.
+# Install: cp hooks/prepare-commit-msg .git/hooks/prepare-commit-msg && chmod +x ...
+# (or use the installer in hooks/README.md)
+#
+# Template lookup order: next to this script ($script_dir/.gitmessage),
+#   $ROOT/.gitmessage, $ROOT/hooks/.gitmessage, $GIT_DIR/.gitmessage, $HOME/.gitmessage
+#
+# Placeholders substituted in the template:
+#   {{BRANCH}}  -> current branch name (e.g. feature/ABC-123-login)
+#   {{TICKET}}  -> ticket id parsed from the branch (e.g. ABC-123)
+#
+# Behavior:
+#   - merge/squash commits are left untouched (their messages are generated)
+#   - `git commit` (editor, no -m): if the message is empty, the rendered
+#     template is prepended above git's status comments
+#   - `git commit -m "..."` (source=message): left untouched unless
+#     PRECOMMIT_INJECT_TICKET=1, in which case the ticket id is prepended to
+#     the subject (e.g. `feat: x` -> `ABC-123: feat: x`)
+#   - when git already loaded commit.template (source=template), only
+#     placeholder substitution is applied to the existing content
+#
+# To enable git's own template loading as well, run:
+#   git config commit.template .gitmessage
+# (This hook works whether or not that is set.)
+
+set -euo pipefail
+
+msg_file="${1:-}"
+source="${2:-}"
+
+[[ -n "$msg_file" ]] || exit 0
+
+# Don't touch generated merge/squash messages.
+if [[ "$source" == "merge" || "$source" == "squash" ]]; then
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+git_dir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+# Directory this script lives in (works for the source copy in hooks/ and the
+# installed copy in .git/hooks/).
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+template=""
+for cand in "$script_dir/.gitmessage" "$root/.gitmessage" "$root/hooks/.gitmessage" "$git_dir/.gitmessage" "$HOME/.gitmessage"; do
+  if [[ -f "$cand" ]]; then
+    template="$cand"
+    break
+  fi
+done
+
+# Extract a ticket id from the branch name (e.g. feature/ABC-123-login -> ABC-123).
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+ticket=""
+if [[ "$branch" =~ ([A-Z][A-Z0-9]+-[0-9]+) ]]; then
+  ticket="${BASH_REMATCH[1]}"
+fi
+
+# Render placeholders from stdin to stdout.
+render() {
+  sed -e "s|{{BRANCH}}|${branch:-}|g" -e "s|{{TICKET}}|${ticket:-}|g"
+}
+
+# True if the message file has any non-blank, non-comment line.
+has_real_content() {
+  grep -Eqv '^[[:space:]]*(#|$)' "$1" 2>/dev/null
+}
+
+if [[ "$source" == "template" ]]; then
+  # git already filled in commit.template; just substitute placeholders.
+  tmp="$(mktemp)"
+  render < "$msg_file" > "$tmp"
+  mv "$tmp" "$msg_file"
+elif ! has_real_content "$msg_file"; then
+  # Fresh editor open (no -m): seed from template, or a ticket hint.
+  if [[ -n "$template" ]]; then
+    # Prepend rendered template above git's status comments.
+    tmp="$(mktemp)"
+    { render < "$template"; echo; cat "$msg_file"; } > "$tmp"
+    mv "$tmp" "$msg_file"
+  elif [[ -n "$ticket" && "${PRECOMMIT_INJECT_TICKET:-0}" == "1" ]]; then
+    tmp="$(mktemp)"
+    { echo "# Ticket from branch: ${ticket}"; cat "$msg_file"; } > "$tmp"
+    mv "$tmp" "$msg_file"
+  fi
+elif [[ "$source" == "message" && "${PRECOMMIT_INJECT_TICKET:-0}" == "1" && -n "$ticket" ]]; then
+  # `git commit -m "..."`: auto-prefix the subject (first line) with the ticket id.
+  tmp="$(mktemp)"
+  awk -v t="$ticket" 'NR==1{print t": " $0; next}1' "$msg_file" > "$tmp"
+  mv "$tmp" "$msg_file"
+fi
+
+exit 0
